@@ -1,510 +1,642 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-from datetime import datetime, date
+import libsql
+from datetime import datetime, date, timedelta
+import hashlib
+import json
 import io
+import uuid
 from pathlib import Path
 
-# ==================== BEÁLLÍTÁSOK ====================
-DB_PATH = Path(__file__).parent / "raktar.db"
+# ============================================================
+# BEÁLLÍTÁSOK
+# ============================================================
 st.set_page_config(
-    page_title="Raktárkészlet Kezelő",
+    page_title="Raktárkezelő",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ==================== ADATBÁZIS ====================
+LOCK_AFTER_HOURS = 3
+BUILD = "v1.0-turso"
+
+# ============================================================
+# ADATBÁZIS KAPCSOLAT (TURSO)
+# ============================================================
+@st.cache_resource
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    """Turso kapcsolat – a secrets.toml-ból olvassa az adatokat."""
+    try:
+        url = st.secrets["turso"]["url"]
+        token = st.secrets["turso"]["token"]
+    except Exception:
+        st.error(
+            "❌ Nincs beállítva a Turso kapcsolat.\n\n"
+            "Hozd létre a `.streamlit/secrets.toml` fájlt ezzel a tartalommal:\n\n"
+            "```toml\n[turso]\nurl = \"libsql://...\"\ntoken = \"...\"\n```"
+        )
+        st.stop()
+
+    conn = libsql.connect(database=url, auth_token=token)
     return conn
 
-def init_db():
-    conn = get_connection()
+
+def init_schema(conn):
+    """Teljes séma létrehozása a React alkalmazás adatmodellje alapján."""
     c = conn.cursor()
-    
-    # Termékek tábla
+
+    # Termékek
     c.execute("""
         CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku TEXT UNIQUE,
+            id TEXT PRIMARY KEY,
+            sku TEXT,
             name TEXT NOT NULL,
-            unit TEXT DEFAULT 'db',
-            min_stock REAL DEFAULT 0,
-            note TEXT,
+            unit TEXT DEFAULT 'kg',
+            kg_per_bag REAL,
+            kg_per_pallet REAL,
+            location TEXT,
+            supplier_id TEXT,
             created_at TEXT
         )
     """)
-    
-    # Készletmozgások tábla
+
+    # Partnerek / Beszállítók
     c.execute("""
-        CREATE TABLE IF NOT EXISTS movements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            movement_type TEXT NOT NULL,  -- 'bevetel' vagy 'kiadas'
-            quantity REAL NOT NULL,
-            movement_date TEXT NOT NULL,
-            note TEXT,
-            created_at TEXT,
-            FOREIGN KEY (product_id) REFERENCES products (id)
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id TEXT PRIMARY KEY,
+            code TEXT,
+            name TEXT NOT NULL,
+            address TEXT,
+            contact TEXT,
+            phone TEXT,
+            email TEXT,
+            created_at TEXT
         )
     """)
-    
-    conn.commit()
-    conn.close()
 
-def get_products_with_stock():
-    """Termékek aktuális készlettel"""
-    conn = get_connection()
-    query = """
-        SELECT 
-            p.id,
-            p.sku,
-            p.name,
-            p.unit,
-            p.min_stock,
-            p.note,
-            COALESCE(SUM(
-                CASE 
-                    WHEN m.movement_type = 'bevetel' THEN m.quantity
-                    WHEN m.movement_type = 'kiadas' THEN -m.quantity
-                    ELSE 0
-                END
-            ), 0) as stock
+    # Batchek (lokáció + mennyiség)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS batches (
+            id TEXT PRIMARY KEY,
+            product_id TEXT NOT NULL,
+            batch_number TEXT NOT NULL,
+            quantity REAL NOT NULL DEFAULT 0,
+            received_qty REAL,
+            location TEXT,
+            supplier_id TEXT,
+            shipment_number TEXT,
+            received_at TEXT,
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+        )
+    """)
+
+    # Mozgások
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS movements (
+            id TEXT PRIMARY KEY,
+            product_id TEXT NOT NULL,
+            batch_id TEXT,
+            type TEXT NOT NULL,          -- 'be' vagy 'ki'
+            quantity REAL NOT NULL,
+            note TEXT,
+            date TEXT NOT NULL,
+            created_at TEXT,
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (batch_id) REFERENCES batches(id)
+        )
+    """)
+
+    # Megrendelések
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id TEXT PRIMARY KEY,
+            shipment_number TEXT,
+            partner_id TEXT,
+            status TEXT DEFAULT 'rögzített',  -- rögzített | kivezetve
+            created_at TEXT,
+            dispatched_at TEXT,
+            FOREIGN KEY (partner_id) REFERENCES suppliers(id)
+        )
+    """)
+
+    # Megrendelés tételek
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            id TEXT PRIMARY KEY,
+            order_id TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            batch_number TEXT,
+            qty REAL NOT NULL,
+            allocated INTEGER DEFAULT 0,
+            FOREIGN KEY (order_id) REFERENCES orders(id),
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        )
+    """)
+
+    # Allokációk (melyik batchből mennyi)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS allocations (
+            id TEXT PRIMARY KEY,
+            order_item_id TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            location TEXT,
+            qty REAL NOT NULL,
+            FOREIGN KEY (order_item_id) REFERENCES order_items(id),
+            FOREIGN KEY (batch_id) REFERENCES batches(id)
+        )
+    """)
+
+    # Napi zárások
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS closings (
+            id TEXT PRIMARY KEY,
+            date TEXT UNIQUE NOT NULL,
+            incoming_kg REAL DEFAULT 0,
+            incoming_full_pal REAL DEFAULT 0,
+            incoming_mixed_pal REAL DEFAULT 0,
+            outgoing_kg REAL DEFAULT 0,
+            outgoing_pal REAL DEFAULT 0,
+            outgoing_bags REAL DEFAULT 0,
+            picking_lines INTEGER DEFAULT 0,
+            pal_on_stock REAL DEFAULT 0,
+            storage_fee REAL DEFAULT 0,
+            incoming_fee REAL DEFAULT 0,
+            picking_fee REAL DEFAULT 0,
+            outgoing_fee REAL DEFAULT 0,
+            closed_at TEXT
+        )
+    """)
+
+    # Díjszabás (évenként)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rates (
+            id TEXT PRIMARY KEY,
+            year INTEGER UNIQUE NOT NULL,
+            storage_per_pallet REAL DEFAULT 0,
+            incoming_full_pal REAL DEFAULT 0,
+            incoming_mixed_pal REAL DEFAULT 0,
+            picking_per_line REAL DEFAULT 0,
+            outgoing_per_pal REAL DEFAULT 0,
+            outgoing_per_bag REAL DEFAULT 0
+        )
+    """)
+
+    # Beállítások + biztonság
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    conn.commit()
+
+
+def uid():
+    return str(uuid.uuid4())
+
+
+def now_iso():
+    return datetime.now().isoformat()
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+# ============================================================
+# SEGÉDFÜGGVÉNYEK
+# ============================================================
+def query_df(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
+def execute(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    return cur
+
+
+def get_setting(conn, key, default=None):
+    df = query_df(conn, "SELECT value FROM settings WHERE key = ?", (key,))
+    if df.empty:
+        return default
+    return df.iloc[0]["value"]
+
+
+def set_setting(conn, key, value):
+    execute(conn, """
+        INSERT INTO settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, str(value)))
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# KÉSZLET SZÁMÍTÁS
+# ============================================================
+def total_stock(conn, product_id: str) -> float:
+    df = query_df(conn, "SELECT COALESCE(SUM(quantity), 0) AS s FROM batches WHERE product_id = ?", (product_id,))
+    return float(df.iloc[0]["s"]) if not df.empty else 0.0
+
+
+def get_products_with_stock(conn):
+    sql = """
+        SELECT
+            p.id, p.sku, p.name, p.unit, p.kg_per_bag, p.kg_per_pallet,
+            p.location, p.supplier_id,
+            COALESCE(SUM(b.quantity), 0) AS stock
         FROM products p
-        LEFT JOIN movements m ON p.id = m.product_id
+        LEFT JOIN batches b ON b.product_id = p.id
         GROUP BY p.id
         ORDER BY p.name
     """
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
+    return query_df(conn, sql)
 
-def get_movements(limit=500):
-    conn = get_connection()
-    query = """
-        SELECT 
-            m.id,
-            m.movement_date,
-            p.sku,
-            p.name as product_name,
-            m.movement_type,
-            m.quantity,
-            p.unit,
-            m.note,
-            m.created_at
+
+# ============================================================
+# AUTH / ZÁROLÁS
+# ============================================================
+def check_auth(conn):
+    """Visszaadja az auth állapotot és kezeli a zárolást."""
+    if "auth_state" not in st.session_state:
+        st.session_state.auth_state = "checking"
+    if "last_activity" not in st.session_state:
+        st.session_state.last_activity = datetime.now()
+
+    # Aktivitás frissítése
+    st.session_state.last_activity = datetime.now()
+
+    pw_hash = get_setting(conn, "password_hash")
+
+    if not pw_hash:
+        return "unlocked"  # Nincs jelszó beállítva
+
+    # Ha van jelszó és lejárt az idő
+    if st.session_state.auth_state == "unlocked":
+        elapsed = (datetime.now() - st.session_state.last_activity).total_seconds()
+        if elapsed > LOCK_AFTER_HOURS * 3600:
+            st.session_state.auth_state = "locked"
+
+    return st.session_state.auth_state
+
+
+def login_screen(conn):
+    st.title("🔒 Raktárkezelő – Belépés")
+    st.caption(BUILD)
+
+    pw = st.text_input("Jelszó", type="password", key="login_pw")
+    if st.button("Belépés", type="primary"):
+        stored = get_setting(conn, "password_hash")
+        if stored and sha256(pw) == stored:
+            st.session_state.auth_state = "unlocked"
+            st.session_state.last_activity = datetime.now()
+            st.rerun()
+        else:
+            st.error("Hibás jelszó.")
+
+
+def setup_password_screen(conn):
+    st.title("🔐 Közös jelszó beállítása")
+    st.info("Ezt a jelszót mindenki használni fogja. 3 óra tétlenség után újra be kell írni.")
+
+    pw1 = st.text_input("Új jelszó", type="password")
+    pw2 = st.text_input("Jelszó megerősítése", type="password")
+
+    if st.button("Jelszó beállítása és belépés", type="primary"):
+        if len(pw1) < 4:
+            st.error("Legalább 4 karakter legyen.")
+        elif pw1 != pw2:
+            st.error("A két jelszó nem egyezik.")
+        else:
+            set_setting(conn, "password_hash", sha256(pw1))
+            st.session_state.auth_state = "unlocked"
+            st.success("Jelszó elmentve.")
+            st.rerun()
+
+
+# ============================================================
+# OLDALAK
+# ============================================================
+def page_home(conn):
+    st.header("📦 Áttekintés")
+
+    products = get_products_with_stock(conn)
+    batches = query_df(conn, "SELECT * FROM batches WHERE quantity > 0")
+    pending = query_df(conn, "SELECT COUNT(*) AS c FROM orders WHERE status = 'rögzített'")
+    today_mov = query_df(conn, "SELECT COUNT(*) AS c FROM movements WHERE date(date) = date('now')")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Termékek készleten", len(products[products["stock"] > 0]) if not products.empty else 0)
+    c2.metric("Aktív batchek", len(batches))
+    c3.metric("Függő megrendelések", int(pending.iloc[0]["c"]) if not pending.empty else 0)
+    c4.metric("Mai mozgások", int(today_mov.iloc[0]["c"]) if not today_mov.empty else 0)
+
+    st.subheader("Alacsony / elfogyott készlet")
+    if not products.empty:
+        low = products[products["stock"] <= 0]
+        if not low.empty:
+            st.dataframe(low[["sku", "name", "stock", "unit"]], use_container_width=True, hide_index=True)
+        else:
+            st.success("Nincs elfogyott termék.")
+    else:
+        st.info("Még nincsenek termékek.")
+
+
+def page_products(conn):
+    st.header("Termékek")
+
+    tab1, tab2 = st.tabs(["Lista", "Új termék"])
+
+    with tab1:
+        df = get_products_with_stock(conn)
+        if df.empty:
+            st.info("Még nincsenek termékek.")
+        else:
+            st.dataframe(
+                df[["sku", "name", "stock", "unit", "kg_per_bag", "kg_per_pallet"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Törlés
+            with st.expander("Termék törlése"):
+                options = {f"{r['name']} ({r['sku'] or '-'})": r["id"] for _, r in df.iterrows()}
+                sel = st.selectbox("Válassz terméket", list(options.keys()))
+                if st.button("Törlés", type="primary"):
+                    pid = options[sel]
+                    # Csak akkor engedjük, ha nincs batch
+                    b = query_df(conn, "SELECT COUNT(*) AS c FROM batches WHERE product_id = ? AND quantity > 0", (pid,))
+                    if int(b.iloc[0]["c"]) > 0:
+                        st.error("Van még készlet ezen a terméken – előbb ürítsd ki.")
+                    else:
+                        execute(conn, "DELETE FROM products WHERE id = ?", (pid,))
+                        st.success("Törölve.")
+                        st.rerun()
+
+    with tab2:
+        with st.form("new_product"):
+            col1, col2 = st.columns(2)
+            with col1:
+                name = st.text_input("Termék név *")
+                sku = st.text_input("Cikkszám / SKU")
+                unit = st.selectbox("Egység", ["kg", "db", "doboz", "raklap", "liter", "méter", "csomag"])
+            with col2:
+                kg_bag = st.number_input("Kg / zsák", min_value=0.0, value=25.0, step=1.0)
+                kg_pal = st.number_input("Kg / raklap", min_value=0.0, value=1000.0, step=50.0)
+                location = st.text_input("Alapértelmezett hely")
+
+            if st.form_submit_button("Hozzáadás"):
+                if not name.strip():
+                    st.error("A név kötelező.")
+                else:
+                    execute(conn, """
+                        INSERT INTO products (id, sku, name, unit, kg_per_bag, kg_per_pallet, location, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (uid(), sku.strip() or None, name.strip(), unit, kg_bag, kg_pal, location.strip() or None, now_iso()))
+                    st.success("Termék hozzáadva.")
+                    st.rerun()
+
+
+def page_suppliers(conn):
+    st.header("Partnerek")
+
+    tab1, tab2 = st.tabs(["Lista", "Új partner"])
+
+    with tab1:
+        df = query_df(conn, "SELECT * FROM suppliers ORDER BY name")
+        if df.empty:
+            st.info("Még nincsenek partnerek.")
+        else:
+            st.dataframe(df[["code", "name", "contact", "phone", "email"]], use_container_width=True, hide_index=True)
+
+    with tab2:
+        with st.form("new_supplier"):
+            col1, col2 = st.columns(2)
+            with col1:
+                name = st.text_input("Cégnév *")
+                code = st.text_input("Partner kód")
+                contact = st.text_input("Kapcsolattartó")
+            with col2:
+                phone = st.text_input("Telefon")
+                email = st.text_input("E-mail")
+                address = st.text_area("Cím")
+
+            if st.form_submit_button("Hozzáadás"):
+                if not name.strip():
+                    st.error("A cégnév kötelező.")
+                else:
+                    execute(conn, """
+                        INSERT INTO suppliers (id, code, name, address, contact, phone, email, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (uid(), code.strip() or None, name.strip(), address.strip() or None,
+                          contact.strip() or None, phone.strip() or None, email.strip() or None, now_iso()))
+                    st.success("Partner hozzáadva.")
+                    st.rerun()
+
+
+def page_incoming(conn):
+    st.header("📥 Bevételezés")
+
+    products = query_df(conn, "SELECT id, name, sku, unit FROM products ORDER BY name")
+    suppliers = query_df(conn, "SELECT id, name FROM suppliers ORDER BY name")
+
+    if products.empty:
+        st.warning("Először adj hozzá termékeket.")
+        return
+
+    with st.form("incoming_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            prod_opts = {f"{r['name']} ({r['sku'] or '-'})": r["id"] for _, r in products.iterrows()}
+            product_sel = st.selectbox("Termék *", list(prod_opts.keys()))
+            batch_number = st.text_input("Batch szám *")
+            quantity = st.number_input("Mennyiség *", min_value=0.01, value=1000.0, step=25.0)
+            location = st.text_input("Lokáció (pl. 01.02.015)")
+        with col2:
+            supp_opts = {"— nincs —": None}
+            if not suppliers.empty:
+                supp_opts.update({r["name"]: r["id"] for _, r in suppliers.iterrows()})
+            supplier_sel = st.selectbox("Partner", list(supp_opts.keys()))
+            shipment = st.text_input("Szállítmányszám")
+            received_at = st.date_input("Beérkezés dátuma", value=date.today())
+            note = st.text_area("Megjegyzés")
+
+        if st.form_submit_button("Bevételezés rögzítése", type="primary"):
+            if not batch_number.strip():
+                st.error("A batch szám kötelező.")
+            else:
+                pid = prod_opts[product_sel]
+                sid = supp_opts[supplier_sel]
+                batch_id = uid()
+                mov_id = uid()
+                ts = datetime.combine(received_at, datetime.min.time()).isoformat()
+
+                execute(conn, """
+                    INSERT INTO batches (id, product_id, batch_number, quantity, received_qty, location, supplier_id, shipment_number, received_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (batch_id, pid, batch_number.strip(), quantity, quantity, location.strip() or None, sid, shipment.strip() or None, ts))
+
+                execute(conn, """
+                    INSERT INTO movements (id, product_id, batch_id, type, quantity, note, date, created_at)
+                    VALUES (?, ?, ?, 'be', ?, ?, ?, ?)
+                """, (mov_id, pid, batch_id, quantity, note.strip() or f"szállítmány: {shipment}", ts, now_iso()))
+
+                st.success("Bevételezés rögzítve.")
+                st.rerun()
+
+
+def page_stock(conn):
+    st.header("📦 Készlet (batchek)")
+
+    df = query_df(conn, """
+        SELECT b.batch_number, p.name AS product, p.sku, b.location, b.quantity, p.unit,
+               b.shipment_number, b.received_at, s.name AS supplier
+        FROM batches b
+        JOIN products p ON p.id = b.product_id
+        LEFT JOIN suppliers s ON s.id = b.supplier_id
+        WHERE b.quantity > 0
+        ORDER BY b.received_at DESC
+    """)
+
+    if df.empty:
+        st.info("Nincs készleten lévő batch.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Összesítés termékenként
+        st.subheader("Összesítés termékenként")
+        summary = get_products_with_stock(conn)
+        summary = summary[summary["stock"] > 0][["sku", "name", "stock", "unit"]]
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+
+def page_movements(conn):
+    st.header("📊 Mozgások napló")
+
+    df = query_df(conn, """
+        SELECT m.date, m.type, p.name AS product, p.sku, m.quantity, p.unit, m.note, b.batch_number
         FROM movements m
-        JOIN products p ON m.product_id = p.id
-        ORDER BY m.movement_date DESC, m.id DESC
-        LIMIT ?
-    """
-    df = pd.read_sql_query(query, conn, params=(limit,))
-    conn.close()
-    return df
+        JOIN products p ON p.id = m.product_id
+        LEFT JOIN batches b ON b.id = m.batch_id
+        ORDER BY m.date DESC
+        LIMIT 500
+    """)
 
-def add_product(sku, name, unit, min_stock, note):
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO products (sku, name, unit, min_stock, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (sku or None, name, unit, min_stock, note, datetime.now().isoformat())
+    if df.empty:
+        st.info("Még nincsenek mozgások.")
+    else:
+        df["type"] = df["type"].map({"be": "📥 Bevétel", "ki": "📤 Kiadás"})
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def page_settings(conn):
+    st.header("⚙️ Beállítások")
+
+    st.subheader("Jelszó")
+    current_hash = get_setting(conn, "password_hash")
+    if current_hash:
+        st.success("Jelszavas védelem be van kapcsolva.")
+        if st.button("Jelszó törlése (csak ha tudod a jelenlegit)"):
+            st.session_state.show_remove_pw = True
+    else:
+        st.info("Jelenleg nincs jelszó beállítva.")
+        if st.button("Jelszó beállítása"):
+            st.session_state.auth_state = "setup"
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("Adatbázis info")
+    st.code(f"Build: {BUILD}\nTurso kapcsolat: aktív")
+
+    # Egyszerű export
+    st.subheader("Gyors export")
+    if st.button("Termékek + Készlet exportálása Excelbe"):
+        products = get_products_with_stock(conn)
+        batches = query_df(conn, """
+            SELECT b.batch_number, p.name, p.sku, b.location, b.quantity, p.unit, b.received_at
+            FROM batches b JOIN products p ON p.id = b.product_id
+            WHERE b.quantity > 0
+        """)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            products.to_excel(writer, sheet_name="Termékek", index=False)
+            batches.to_excel(writer, sheet_name="Készlet", index=False)
+        buffer.seek(0)
+        st.download_button(
+            "Letöltés",
+            data=buffer,
+            file_name=f"raktar-export-{today_str()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        conn.commit()
-        return True, "Termék sikeresen hozzáadva!"
-    except sqlite3.IntegrityError:
-        return False, "Ez a SKU már létezik!"
-    except Exception as e:
-        return False, f"Hiba: {e}"
-    finally:
-        conn.close()
 
-def update_product(product_id, sku, name, unit, min_stock, note):
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            "UPDATE products SET sku=?, name=?, unit=?, min_stock=?, note=? WHERE id=?",
-            (sku or None, name, unit, min_stock, note, product_id)
-        )
-        conn.commit()
-        return True, "Termék frissítve!"
-    except sqlite3.IntegrityError:
-        return False, "Ez a SKU már létezik!"
-    except Exception as e:
-        return False, f"Hiba: {e}"
-    finally:
-        conn.close()
 
-def delete_product(product_id):
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        # Először a mozgásokat töröljük
-        c.execute("DELETE FROM movements WHERE product_id=?", (product_id,))
-        c.execute("DELETE FROM products WHERE id=?", (product_id,))
-        conn.commit()
-        return True, "Termék törölve!"
-    except Exception as e:
-        return False, f"Hiba: {e}"
-    finally:
-        conn.close()
-
-def add_movement(product_id, movement_type, quantity, movement_date, note):
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO movements (product_id, movement_type, quantity, movement_date, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (product_id, movement_type, quantity, movement_date, note, datetime.now().isoformat())
-        )
-        conn.commit()
-        return True, "Készletmozgás rögzítve!"
-    except Exception as e:
-        return False, f"Hiba: {e}"
-    finally:
-        conn.close()
-
-def delete_movement(movement_id):
-    conn = get_connection()
-    try:
-        c = conn.cursor()
-        c.execute("DELETE FROM movements WHERE id=?", (movement_id,))
-        conn.commit()
-        return True, "Mozgás törölve!"
-    except Exception as e:
-        return False, f"Hiba: {e}"
-    finally:
-        conn.close()
-
-# ==================== SEGÉDFÜGGVÉNYEK ====================
-def style_stock(val, min_stock):
-    if val <= 0:
-        return "background-color: #ffcccc; color: #990000; font-weight: bold"
-    elif val <= min_stock:
-        return "background-color: #fff3cd; color: #856404"
-    return ""
-
-# ==================== ALKALMAZÁS ====================
+# ============================================================
+# FŐALKALMAZÁS
+# ============================================================
 def main():
-    init_db()
-    
-    st.title("📦 Raktárkészlet Kezelő")
-    st.caption("Egyszerű, ingyenes készletkezelő rendszer")
-    
-    # Oldalsáv navigáció
+    conn = get_connection()
+    init_schema(conn)
+
+    # Auth ellenőrzés
+    auth = check_auth(conn)
+
+    if auth == "setup" or (get_setting(conn, "password_hash") is None and st.session_state.get("force_setup")):
+        setup_password_screen(conn)
+        return
+
+    if auth == "locked":
+        login_screen(conn)
+        return
+
+    # === FŐMENÜ ===
+    st.sidebar.title("📦 Raktárkezelő")
+    st.sidebar.caption(BUILD)
+
     menu = st.sidebar.radio(
         "Menü",
-        ["🏠 Kezdőlap", "📋 Termékek", "📥 Bevételezés / Kiadás", "📊 Mozgások napló", "📁 Import / Export"]
+        [
+            "🏠 Áttekintés",
+            "📥 Bevételezés",
+            "📦 Készlet",
+            "📋 Termékek",
+            "🚚 Partnerek",
+            "📊 Mozgások",
+            "⚙️ Beállítások",
+        ]
     )
-    
+
     st.sidebar.markdown("---")
-    st.sidebar.info("Max. 5 felhasználóval ajánlott. Az adatok a szerveren tárolódnak.")
-    
-    # ========== KEZDŐLAP ==========
-    if menu == "🏠 Kezdőlap":
-        st.header("Áttekintés")
-        
-        df = get_products_with_stock()
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Termékek száma", len(df))
-        with col2:
-            low = len(df[df["stock"] <= df["min_stock"]]) if not df.empty else 0
-            st.metric("Alacsony készlet", low, delta_color="inverse")
-        with col3:
-            zero = len(df[df["stock"] <= 0]) if not df.empty else 0
-            st.metric("Elfogyott", zero, delta_color="inverse")
-        with col4:
-            total_qty = df["stock"].sum() if not df.empty else 0
-            st.metric("Összes darab", f"{total_qty:.0f}")
-        
-        st.subheader("Alacsony készletű termékek")
-        if not df.empty:
-            low_df = df[df["stock"] <= df["min_stock"]].copy()
-            if not low_df.empty:
-                low_df = low_df[["sku", "name", "stock", "min_stock", "unit"]]
-                low_df.columns = ["SKU", "Név", "Készlet", "Min. készlet", "Egység"]
-                st.dataframe(low_df, use_container_width=True, hide_index=True)
-            else:
-                st.success("Nincs alacsony készletű termék. 👍")
-        else:
-            st.info("Még nincsenek termékek. Menj a **Termékek** menüpontra!")
-    
-    # ========== TERMÉKEK ==========
+    if st.sidebar.button("Kijelentkezés / Zárolás"):
+        st.session_state.auth_state = "locked"
+        st.rerun()
+
+    # Oldalak
+    if menu == "🏠 Áttekintés":
+        page_home(conn)
+    elif menu == "📥 Bevételezés":
+        page_incoming(conn)
+    elif menu == "📦 Készlet":
+        page_stock(conn)
     elif menu == "📋 Termékek":
-        st.header("Termékek")
-        
-        tab1, tab2 = st.tabs(["Lista", "Új termék / Szerkesztés"])
-        
-        with tab1:
-            df = get_products_with_stock()
-            if df.empty:
-                st.info("Még nincsenek termékek.")
-            else:
-                display_df = df[["id", "sku", "name", "stock", "min_stock", "unit", "note"]].copy()
-                display_df.columns = ["ID", "SKU", "Név", "Készlet", "Min. készlet", "Egység", "Megjegyzés"]
-                
-                # Színezés
-                def highlight(row):
-                    styles = [""] * len(row)
-                    stock = row["Készlet"]
-                    min_s = row["Min. készlet"]
-                    if stock <= 0:
-                        styles[3] = "background-color: #ffcccc; color: #990000; font-weight: bold"
-                    elif stock <= min_s:
-                        styles[3] = "background-color: #fff3cd; color: #856404"
-                    return styles
-                
-                st.dataframe(
-                    display_df.style.apply(highlight, axis=1),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Törlés
-                st.subheader("Termék törlése")
-                del_id = st.number_input("Törlendő termék ID", min_value=1, step=1, key="del_prod")
-                if st.button("Törlés", type="primary"):
-                    ok, msg = delete_product(int(del_id))
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-        
-        with tab2:
-            st.subheader("Új termék hozzáadása")
-            with st.form("add_product_form", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                with col1:
-                    sku = st.text_input("SKU / Cikkszám (opcionális)")
-                    name = st.text_input("Termék neve *", placeholder="pl. Csavar M8")
-                    unit = st.selectbox("Egység", ["db", "kg", "m", "l", "csomag", "doboz", "pár"])
-                with col2:
-                    min_stock = st.number_input("Minimum készlet", min_value=0.0, value=0.0, step=1.0)
-                    note = st.text_area("Megjegyzés")
-                
-                submitted = st.form_submit_button("Hozzáadás")
-                if submitted:
-                    if not name.strip():
-                        st.error("A termék neve kötelező!")
-                    else:
-                        ok, msg = add_product(sku.strip() or None, name.strip(), unit, min_stock, note.strip())
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-            
-            st.markdown("---")
-            st.subheader("Meglévő termék szerkesztése")
-            df = get_products_with_stock()
-            if not df.empty:
-                options = {f"{row['name']} (ID: {row['id']})": row['id'] for _, row in df.iterrows()}
-                selected = st.selectbox("Válassz terméket", list(options.keys()))
-                if selected:
-                    pid = options[selected]
-                    prod = df[df["id"] == pid].iloc[0]
-                    
-                    with st.form("edit_product_form"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            sku_e = st.text_input("SKU", value=prod["sku"] or "")
-                            name_e = st.text_input("Név *", value=prod["name"])
-                            unit_e = st.selectbox("Egység", ["db", "kg", "m", "l", "csomag", "doboz", "pár"], 
-                                                  index=["db", "kg", "m", "l", "csomag", "doboz", "pár"].index(prod["unit"]) if prod["unit"] in ["db", "kg", "m", "l", "csomag", "doboz", "pár"] else 0)
-                        with col2:
-                            min_e = st.number_input("Minimum készlet", min_value=0.0, value=float(prod["min_stock"]), step=1.0)
-                            note_e = st.text_area("Megjegyzés", value=prod["note"] or "")
-                        
-                        if st.form_submit_button("Mentés"):
-                            ok, msg = update_product(pid, sku_e.strip() or None, name_e.strip(), unit_e, min_e, note_e.strip())
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
-    
-    # ========== BEVÉTELEZÉS / KIADÁS ==========
-    elif menu == "📥 Bevételezés / Kiadás":
-        st.header("Bevételezés / Kiadás")
-        
-        df = get_products_with_stock()
-        if df.empty:
-            st.warning("Először adj hozzá termékeket a **Termékek** menüben!")
-        else:
-            options = {f"{row['name']} (készlet: {row['stock']:.0f} {row['unit']})": row['id'] for _, row in df.iterrows()}
-            
-            with st.form("movement_form", clear_on_submit=True):
-                col1, col2 = st.columns(2)
-                with col1:
-                    selected = st.selectbox("Termék *", list(options.keys()))
-                    movement_type = st.radio("Típus *", ["bevetel", "kiadas"], 
-                                            format_func=lambda x: "📥 Bevételezés" if x == "bevetel" else "📤 Kiadás",
-                                            horizontal=True)
-                    quantity = st.number_input("Mennyiség *", min_value=0.01, value=1.0, step=1.0)
-                with col2:
-                    movement_date = st.date_input("Dátum *", value=date.today())
-                    note = st.text_area("Megjegyzés (pl. szállító, cél)")
-                
-                submitted = st.form_submit_button("Rögzítés", type="primary")
-                if submitted:
-                    pid = options[selected]
-                    ok, msg = add_movement(pid, movement_type, quantity, movement_date.isoformat(), note.strip())
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-    
-    # ========== MOZGÁSOK NAPLÓ ==========
-    elif menu == "📊 Mozgások napló":
-        st.header("Készletmozgások naplója")
-        
-        df_mov = get_movements()
-        if df_mov.empty:
-            st.info("Még nincsenek mozgások.")
-        else:
-            display = df_mov.copy()
-            display["movement_type"] = display["movement_type"].map({"bevetel": "📥 Bevételezés", "kiadas": "📤 Kiadás"})
-            display = display[["id", "movement_date", "sku", "product_name", "movement_type", "quantity", "unit", "note"]]
-            display.columns = ["ID", "Dátum", "SKU", "Termék", "Típus", "Mennyiség", "Egység", "Megjegyzés"]
-            
-            st.dataframe(display, use_container_width=True, hide_index=True)
-            
-            # Nyomtatás tipp
-            st.info("💡 Nyomtatáshoz használd a böngésző nyomtatás funkcióját (Ctrl+P), vagy exportáld Excelbe.")
-            
-            # Törlés
-            st.subheader("Mozgás törlése")
-            del_mov = st.number_input("Törlendő mozgás ID", min_value=1, step=1, key="del_mov")
-            if st.button("Mozgás törlése"):
-                ok, msg = delete_movement(int(del_mov))
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-    
-    # ========== IMPORT / EXPORT ==========
-    elif menu == "📁 Import / Export":
-        st.header("Import / Export")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📤 Export Excelbe")
-            
-            # Termékek export
-            df_prod = get_products_with_stock()
-            if not df_prod.empty:
-                export_prod = df_prod[["sku", "name", "stock", "min_stock", "unit", "note"]].copy()
-                export_prod.columns = ["SKU", "Név", "Készlet", "Min. készlet", "Egység", "Megjegyzés"]
-                
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    export_prod.to_excel(writer, sheet_name="Termékek", index=False)
-                    
-                    # Mozgások is
-                    df_mov = get_movements(limit=5000)
-                    if not df_mov.empty:
-                        export_mov = df_mov[["movement_date", "sku", "product_name", "movement_type", "quantity", "unit", "note"]].copy()
-                        export_mov["movement_type"] = export_mov["movement_type"].map({"bevetel": "Bevételezés", "kiadas": "Kiadás"})
-                        export_mov.columns = ["Dátum", "SKU", "Termék", "Típus", "Mennyiség", "Egység", "Megjegyzés"]
-                        export_mov.to_excel(writer, sheet_name="Mozgások", index=False)
-                
-                buffer.seek(0)
-                st.download_button(
-                    label="Letöltés Excel (Termékek + Mozgások)",
-                    data=buffer,
-                    file_name=f"raktar_export_{date.today().isoformat()}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.info("Nincs exportálható adat.")
-        
-        with col2:
-            st.subheader("📥 Import Excelből")
-            st.markdown("""
-            **Elvárt oszlopok a termékekhez:**
-            - `SKU` (opcionális)
-            - `Név` (kötelező)
-            - `Egység` (pl. db)
-            - `Min. készlet`
-            - `Megjegyzés`
-            
-            Az import csak új termékeket ad hozzá (nem frissít meglévőket).
-            """)
-            
-            uploaded = st.file_uploader("Excel fájl feltöltése", type=["xlsx", "xls"])
-            if uploaded:
-                try:
-                    df_imp = pd.read_excel(uploaded)
-                    st.write("Előnézet:")
-                    st.dataframe(df_imp.head(10), use_container_width=True)
-                    
-                    if st.button("Importálás indítása"):
-                        # Oszlopok normalizálása
-                        col_map = {}
-                        for col in df_imp.columns:
-                            cl = str(col).lower().strip()
-                            if "sku" in cl or "cikkszám" in cl or "cikkszam" in cl:
-                                col_map["sku"] = col
-                            elif "név" in cl or "nev" in cl or "name" in cl or "termék" in cl:
-                                col_map["name"] = col
-                            elif "egység" in cl or "egyseg" in cl or "unit" in cl:
-                                col_map["unit"] = col
-                            elif "min" in cl:
-                                col_map["min_stock"] = col
-                            elif "megj" in cl or "note" in cl:
-                                col_map["note"] = col
-                        
-                        if "name" not in col_map:
-                            st.error("Nem található 'Név' oszlop!")
-                        else:
-                            success = 0
-                            errors = []
-                            for _, row in df_imp.iterrows():
-                                name = str(row[col_map["name"]]).strip()
-                                if not name or name == "nan":
-                                    continue
-                                sku = str(row[col_map["sku"]]).strip() if "sku" in col_map else None
-                                if sku == "nan":
-                                    sku = None
-                                unit = str(row[col_map["unit"]]).strip() if "unit" in col_map else "db"
-                                if unit == "nan":
-                                    unit = "db"
-                                min_s = float(row[col_map["min_stock"]]) if "min_stock" in col_map else 0.0
-                                note = str(row[col_map["note"]]).strip() if "note" in col_map else ""
-                                if note == "nan":
-                                    note = ""
-                                
-                                ok, msg = add_product(sku, name, unit, min_s, note)
-                                if ok:
-                                    success += 1
-                                else:
-                                    errors.append(f"{name}: {msg}")
-                            
-                            st.success(f"{success} termék sikeresen importálva.")
-                            if errors:
-                                with st.expander("Hibák"):
-                                    for e in errors[:20]:
-                                        st.write(e)
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Hiba az Excel olvasásakor: {e}")
-        
-        st.markdown("---")
-        st.subheader("🖨️ Nyomtatás")
-        st.info("""
-        **Hogyan nyomtass:**
-        1. Menj a **Termékek** vagy **Mozgások napló** oldalra
-        2. Nyomd meg a **Ctrl + P** (Windows) vagy **Cmd + P** (Mac) billentyűkombinációt
-        3. Válaszd a „Mentés PDF-ként” opciót, ha fájlba szeretnéd
-        """)
+        page_products(conn)
+    elif menu == "🚚 Partnerek":
+        page_suppliers(conn)
+    elif menu == "📊 Mozgások":
+        page_movements(conn)
+    elif menu == "⚙️ Beállítások":
+        page_settings(conn)
+
 
 if __name__ == "__main__":
     main()
