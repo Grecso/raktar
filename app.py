@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 LOCK_AFTER_HOURS = 3
-BUILD = "v1.0-turso"
+BUILD = "v1.1-orders"
 
 # ============================================================
 # ADATBÁZIS KAPCSOLAT (TURSO)
@@ -540,6 +540,212 @@ def page_movements(conn):
         st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def page_orders(conn):
+    st.header("📋 Megrendelések")
+
+    tab_list, tab_new, tab_dispatch = st.tabs(["Lista", "Új megrendelés", "Kivezetés"])
+
+    # ---------- LISTA ----------
+    with tab_list:
+        orders = query_df(conn, """
+            SELECT o.id, o.shipment_number, o.status, o.created_at, o.dispatched_at,
+                   s.name AS partner
+            FROM orders o
+            LEFT JOIN suppliers s ON s.id = o.partner_id
+            ORDER BY o.created_at DESC
+            LIMIT 200
+        """)
+        if orders.empty:
+            st.info("Még nincsenek megrendelések.")
+        else:
+            st.dataframe(orders[["shipment_number", "partner", "status", "created_at", "dispatched_at"]],
+                         use_container_width=True, hide_index=True)
+
+            # Részletek
+            with st.expander("Megrendelés részletei"):
+                opts = {f"{r['shipment_number'] or r['id'][:8]} – {r['partner'] or '?'} ({r['status']})": r["id"]
+                        for _, r in orders.iterrows()}
+                sel = st.selectbox("Válassz megrendelést", list(opts.keys()), key="ord_detail")
+                if sel:
+                    oid = opts[sel]
+                    items = query_df(conn, """
+                        SELECT oi.id, p.name, p.sku, oi.batch_number, oi.qty,
+                               COALESCE(SUM(a.qty), 0) AS allocated
+                        FROM order_items oi
+                        JOIN products p ON p.id = oi.product_id
+                        LEFT JOIN allocations a ON a.order_item_id = oi.id
+                        WHERE oi.order_id = ?
+                        GROUP BY oi.id
+                    """, (oid,))
+                    st.dataframe(items, use_container_width=True, hide_index=True)
+
+                    allocs = query_df(conn, """
+                        SELECT p.name, b.batch_number, b.location, a.qty
+                        FROM allocations a
+                        JOIN order_items oi ON oi.id = a.order_item_id
+                        JOIN batches b ON b.id = a.batch_id
+                        JOIN products p ON p.id = oi.product_id
+                        WHERE oi.order_id = ?
+                    """, (oid,))
+                    if not allocs.empty:
+                        st.markdown("**Allokációk (lokációk):**")
+                        st.dataframe(allocs, use_container_width=True, hide_index=True)
+
+    # ---------- ÚJ MEGBRENDELÉS ----------
+    with tab_new:
+        products = query_df(conn, "SELECT id, name, sku, unit FROM products ORDER BY name")
+        suppliers = query_df(conn, "SELECT id, name FROM suppliers ORDER BY name")
+        batches = query_df(conn, """
+            SELECT b.id, b.batch_number, b.quantity, b.location, p.name AS product, p.id AS product_id
+            FROM batches b
+            JOIN products p ON p.id = b.product_id
+            WHERE b.quantity > 0
+            ORDER BY b.batch_number
+        """)
+
+        if products.empty:
+            st.warning("Nincsenek termékek.")
+        else:
+            with st.form("new_order"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    shipment = st.text_input("Szállítmányszám")
+                    if not suppliers.empty:
+                        supp_opts = {r["name"]: r["id"] for _, r in suppliers.iterrows()}
+                        partner = st.selectbox("Partner", list(supp_opts.keys()))
+                    else:
+                        partner = None
+                        st.info("Nincs partner – előbb adj hozzá.")
+                with col2:
+                    st.write("")  # spacer
+
+                st.markdown("**Tételek** (batch szám + mennyiség)")
+                # Egyszerű: maximum 5 tétel a formban
+                items_data = []
+                for i in range(5):
+                    c1, c2, c3 = st.columns([3, 2, 2])
+                    with c1:
+                        bn = st.text_input(f"Batch szám #{i+1}", key=f"bn_{i}")
+                    with c2:
+                        qty = st.number_input(f"Mennyiség #{i+1}", min_value=0.0, value=0.0, step=25.0, key=f"qty_{i}")
+                    with c3:
+                        st.write("")
+                    if bn.strip() and qty > 0:
+                        items_data.append({"batch_number": bn.strip(), "qty": qty})
+
+                submitted = st.form_submit_button("Megrendelés rögzítése", type="primary")
+                if submitted:
+                    if not items_data:
+                        st.error("Legalább egy tételt meg kell adni.")
+                    else:
+                        order_id = uid()
+                        partner_id = supp_opts.get(partner) if partner else None
+                        execute(conn, """
+                            INSERT INTO orders (id, shipment_number, partner_id, status, created_at)
+                            VALUES (?, ?, ?, 'rögzített', ?)
+                        """, (order_id, shipment.strip() or None, partner_id, now_iso()))
+
+                        errors = []
+                        for it in items_data:
+                            # Keressük a batcheket ezzel a batch számmal
+                            matching = batches[batches["batch_number"].str.lower() == it["batch_number"].lower()]
+                            if matching.empty:
+                                errors.append(f"Batch nem található: {it['batch_number']}")
+                                continue
+
+                            # Best-fit: a legközelebbi szabad mennyiségű lokáció(k)
+                            needed = it["qty"]
+                            product_id = matching.iloc[0]["product_id"]
+                            item_id = uid()
+                            execute(conn, """
+                                INSERT INTO order_items (id, order_id, product_id, batch_number, qty, allocated)
+                                VALUES (?, ?, ?, ?, ?, 0)
+                            """, (item_id, order_id, product_id, it["batch_number"], needed))
+
+                            # Lefoglalt mennyiség (más rögzített rendelésekből)
+                            reserved = query_df(conn, """
+                                SELECT a.batch_id, COALESCE(SUM(a.qty), 0) AS reserved
+                                FROM allocations a
+                                JOIN order_items oi ON oi.id = a.order_item_id
+                                JOIN orders o ON o.id = oi.order_id
+                                WHERE o.status = 'rögzített' AND o.id != ?
+                                GROUP BY a.batch_id
+                            """, (order_id,))
+                            reserved_map = {r["batch_id"]: r["reserved"] for _, r in reserved.iterrows()} if not reserved.empty else {}
+
+                            candidates = []
+                            for _, b in matching.iterrows():
+                                free = b["quantity"] - reserved_map.get(b["id"], 0)
+                                if free > 0.0001:
+                                    candidates.append({"id": b["id"], "location": b["location"] or "", "free": free})
+
+                            # Best-fit allokáció
+                            remaining = needed
+                            candidates = sorted(candidates, key=lambda x: abs(x["free"] - remaining))
+                            for c in candidates:
+                                if remaining <= 0:
+                                    break
+                                take = min(c["free"], remaining)
+                                execute(conn, """
+                                    INSERT INTO allocations (id, order_item_id, batch_id, location, qty)
+                                    VALUES (?, ?, ?, ?, ?)
+                                """, (uid(), item_id, c["id"], c["location"], take))
+                                remaining -= take
+
+                            if remaining > 0.0001:
+                                errors.append(f"Nem volt elég szabad készlet a batchhez: {it['batch_number']} (hiány: {remaining:.1f})")
+                            else:
+                                execute(conn, "UPDATE order_items SET allocated = 1 WHERE id = ?", (item_id,))
+
+                        if errors:
+                            st.warning("Megrendelés rögzítve, de voltak problémák:\n" + "\n".join(errors))
+                        else:
+                            st.success("Megrendelés sikeresen rögzítve és allokálva.")
+                        st.rerun()
+
+    # ---------- KIVEZETÉS ----------
+    with tab_dispatch:
+        pending = query_df(conn, """
+            SELECT o.id, o.shipment_number, s.name AS partner, o.created_at
+            FROM orders o
+            LEFT JOIN suppliers s ON s.id = o.partner_id
+            WHERE o.status = 'rögzített'
+            ORDER BY o.created_at
+        """)
+        if pending.empty:
+            st.info("Nincs kivezetésre váró megrendelés.")
+        else:
+            opts = {f"{r['shipment_number'] or r['id'][:8]} – {r['partner'] or '?'}": r["id"]
+                    for _, r in pending.iterrows()}
+            sel = st.selectbox("Megrendelés kivezetése", list(opts.keys()))
+            if st.button("Kivezetés végrehajtása", type="primary"):
+                oid = opts[sel]
+                # Allokációk alapján csökkentjük a batcheket és létrehozunk ki mozgásokat
+                allocs = query_df(conn, """
+                    SELECT a.batch_id, a.qty, a.location, oi.product_id, b.batch_number
+                    FROM allocations a
+                    JOIN order_items oi ON oi.id = a.order_item_id
+                    JOIN batches b ON b.id = a.batch_id
+                    WHERE oi.order_id = ?
+                """, (oid,))
+
+                for _, a in allocs.iterrows():
+                    # Batch mennyiség csökkentése
+                    execute(conn, "UPDATE batches SET quantity = quantity - ? WHERE id = ?", (a["qty"], a["batch_id"]))
+                    # Ki mozgás
+                    execute(conn, """
+                        INSERT INTO movements (id, product_id, batch_id, type, quantity, note, date, created_at)
+                        VALUES (?, ?, ?, 'ki', ?, ?, ?, ?)
+                    """, (uid(), a["product_id"], a["batch_id"], a["qty"],
+                          f"Kivezetés – szállítmány, batch: {a['batch_number']}, hely: {a['location']}",
+                          now_iso(), now_iso()))
+
+                execute(conn, "UPDATE orders SET status = 'kivezetve', dispatched_at = ? WHERE id = ?",
+                        (now_iso(), oid))
+                st.success("Kivezetés kész. A készlet frissült.")
+                st.rerun()
+
+
 def page_settings(conn):
     st.header("⚙️ Beállítások")
 
@@ -608,6 +814,7 @@ def main():
         [
             "🏠 Áttekintés",
             "📥 Bevételezés",
+            "📋 Megrendelések",
             "📦 Készlet",
             "📋 Termékek",
             "🚚 Partnerek",
@@ -626,6 +833,8 @@ def main():
         page_home(conn)
     elif menu == "📥 Bevételezés":
         page_incoming(conn)
+    elif menu == "📋 Megrendelések":
+        page_orders(conn)
     elif menu == "📦 Készlet":
         page_stock(conn)
     elif menu == "📋 Termékek":
