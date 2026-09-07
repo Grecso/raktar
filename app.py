@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 LOCK_AFTER_HOURS = 3
-BUILD = "v1.1-orders"
+BUILD = "v1.2-fix"
 
 # ============================================================
 # ADATBÁZIS KAPCSOLAT (TURSO)
@@ -38,17 +38,23 @@ def get_connection():
         )
         st.stop()
 
-    conn = libsql.connect(database=url, auth_token=token)
-    return conn
+    try:
+        # Hivatalos libsql minta
+        conn = libsql.connect(database=url, auth_token=token)
+        return conn
+    except TypeError:
+        # régebbi / más signature
+        conn = libsql.connect(url, auth_token=token)
+        return conn
+    except Exception as e:
+        st.error(f"❌ Turso csatlakozási hiba: {e}")
+        st.stop()
 
 
 def init_schema(conn):
-    """Teljes séma létrehozása a React alkalmazás adatmodellje alapján."""
-    c = conn.cursor()
-
-    # Termékek
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
+    """Teljes séma létrehozása – FOREIGN KEY nélkül a jobb Turso kompatibilitásért."""
+    statements = [
+        """CREATE TABLE IF NOT EXISTS products (
             id TEXT PRIMARY KEY,
             sku TEXT,
             name TEXT NOT NULL,
@@ -58,12 +64,8 @@ def init_schema(conn):
             location TEXT,
             supplier_id TEXT,
             created_at TEXT
-        )
-    """)
-
-    # Partnerek / Beszállítók
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS suppliers (
+        )""",
+        """CREATE TABLE IF NOT EXISTS suppliers (
             id TEXT PRIMARY KEY,
             code TEXT,
             name TEXT NOT NULL,
@@ -72,12 +74,8 @@ def init_schema(conn):
             phone TEXT,
             email TEXT,
             created_at TEXT
-        )
-    """)
-
-    # Batchek (lokáció + mennyiség)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS batches (
+        )""",
+        """CREATE TABLE IF NOT EXISTS batches (
             id TEXT PRIMARY KEY,
             product_id TEXT NOT NULL,
             batch_number TEXT NOT NULL,
@@ -86,71 +84,42 @@ def init_schema(conn):
             location TEXT,
             supplier_id TEXT,
             shipment_number TEXT,
-            received_at TEXT,
-            FOREIGN KEY (product_id) REFERENCES products(id),
-            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
-        )
-    """)
-
-    # Mozgások
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS movements (
+            received_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS movements (
             id TEXT PRIMARY KEY,
             product_id TEXT NOT NULL,
             batch_id TEXT,
-            type TEXT NOT NULL,          -- 'be' vagy 'ki'
+            type TEXT NOT NULL,
             quantity REAL NOT NULL,
             note TEXT,
             date TEXT NOT NULL,
-            created_at TEXT,
-            FOREIGN KEY (product_id) REFERENCES products(id),
-            FOREIGN KEY (batch_id) REFERENCES batches(id)
-        )
-    """)
-
-    # Megrendelések
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
             shipment_number TEXT,
             partner_id TEXT,
-            status TEXT DEFAULT 'rögzített',  -- rögzített | kivezetve
+            status TEXT DEFAULT 'rögzített',
             created_at TEXT,
-            dispatched_at TEXT,
-            FOREIGN KEY (partner_id) REFERENCES suppliers(id)
-        )
-    """)
-
-    # Megrendelés tételek
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS order_items (
+            dispatched_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS order_items (
             id TEXT PRIMARY KEY,
             order_id TEXT NOT NULL,
             product_id TEXT NOT NULL,
             batch_number TEXT,
             qty REAL NOT NULL,
-            allocated INTEGER DEFAULT 0,
-            FOREIGN KEY (order_id) REFERENCES orders(id),
-            FOREIGN KEY (product_id) REFERENCES products(id)
-        )
-    """)
-
-    # Allokációk (melyik batchből mennyi)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS allocations (
+            allocated INTEGER DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS allocations (
             id TEXT PRIMARY KEY,
             order_item_id TEXT NOT NULL,
             batch_id TEXT NOT NULL,
             location TEXT,
-            qty REAL NOT NULL,
-            FOREIGN KEY (order_item_id) REFERENCES order_items(id),
-            FOREIGN KEY (batch_id) REFERENCES batches(id)
-        )
-    """)
-
-    # Napi zárások
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS closings (
+            qty REAL NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS closings (
             id TEXT PRIMARY KEY,
             date TEXT UNIQUE NOT NULL,
             incoming_kg REAL DEFAULT 0,
@@ -166,12 +135,8 @@ def init_schema(conn):
             picking_fee REAL DEFAULT 0,
             outgoing_fee REAL DEFAULT 0,
             closed_at TEXT
-        )
-    """)
-
-    # Díjszabás (évenként)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS rates (
+        )""",
+        """CREATE TABLE IF NOT EXISTS rates (
             id TEXT PRIMARY KEY,
             year INTEGER UNIQUE NOT NULL,
             storage_per_pallet REAL DEFAULT 0,
@@ -180,18 +145,26 @@ def init_schema(conn):
             picking_per_line REAL DEFAULT 0,
             outgoing_per_pal REAL DEFAULT 0,
             outgoing_per_bag REAL DEFAULT 0
-        )
-    """)
-
-    # Beállítások + biztonság
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
+        )""",
+        """CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )
-    """)
+        )""",
+    ]
+    for sql in statements:
+        try:
+            conn.execute(sql)
+        except Exception:
+            try:
+                c = conn.cursor()
+                c.execute(sql)
+            except Exception:
+                pass
+    try:
+        conn.commit()
+    except Exception:
+        pass
 
-    conn.commit()
 
 
 def uid():
@@ -210,18 +183,36 @@ def today_str():
 # SEGÉDFÜGGVÉNYEK
 # ============================================================
 def query_df(conn, sql, params=()):
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    cols = [d[0] for d in cur.description] if cur.description else []
-    rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
+    try:
+        cur = conn.execute(sql, params) if params else conn.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description] if getattr(cur, "description", None) else []
+        if not cols and rows:
+            cols = [f"c{i}" for i in range(len(rows[0]))]
+        return pd.DataFrame(rows, columns=cols)
+    except Exception:
+        cur = conn.cursor()
+        cur.execute(sql, params) if params else cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
 
 
 def execute(conn, sql, params=()):
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit()
-    return cur
+    try:
+        if params:
+            conn.execute(sql, params)
+        else:
+            conn.execute(sql)
+        conn.commit()
+    except Exception:
+        cur = conn.cursor()
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        conn.commit()
+    return None
 
 
 def get_setting(conn, key, default=None):
